@@ -121,8 +121,8 @@ public class BroomCleanActionSO : ItemActionSO
             // Cleaning to anything the broom is currently touching (mask-driven).
             TryCleanTouching(ctx);
 
-            // Brush sound while touching ANYTHING (mask-driven, defaults to Everything).
-            bool isTouchingAnything = IsTouchingAnything(ctx);
+            // Brush sound while pushed by collision avoidance (wall or ground).
+            bool isTouchingAnything = IsPushedByEnvironment(ctx);
             TickBrushSound(ctx, isTouchingAnything);
 
             timeSinceFlip += ctx.DeltaTime;
@@ -181,45 +181,15 @@ public class BroomCleanActionSO : ItemActionSO
             Object.Instantiate(so.brushSoundPrefab, pos, rot);
         }
 
-        private bool IsTouchingAnything(ItemActionContext ctx)
+        private static bool IsPushedByEnvironment(ItemActionContext ctx)
         {
             if (ctx.Held == null) return false;
-            if (so.brushSoundTouchMask == 0) return false;
 
-            var heldColliders = ctx.Held.GetComponentsInChildren<Collider>();
-            if (heldColliders == null || heldColliders.Length == 0) return false;
+            var controller = Object.FindFirstObjectByType<PlayerPickupController>();
+            if (controller == null) return false;
 
-            // Use current held pose.
-            Vector3 rootPos = ctx.Held.transform.position;
-            Quaternion rootRot = ctx.Held.transform.rotation;
-
-            for (int i = 0; i < heldColliders.Length; i++)
-            {
-                var c = heldColliders[i];
-                if (c == null) continue;
-                if (!c.enabled) continue;
-                if (c.isTrigger) continue;
-
-                Pose colliderPose = GetColliderWorldPoseAtTarget(c, rootPos, rootRot);
-                OrientedBox obb = GetColliderOrientedBoxAt(c, colliderPose.position, colliderPose.rotation);
-
-                var hits = Physics.OverlapBox(obb.center, obb.halfExtents, obb.rotation, so.brushSoundTouchMask, QueryTriggerInteraction.Collide);
-
-                for (int h = 0; h < hits.Length; h++)
-                {
-                    var hit = hits[h];
-                    if (hit == null) continue;
-                    if (!hit.enabled) continue;
-
-                    // Ignore overlaps with the broom itself.
-                    if (hit.transform.IsChildOf(ctx.Held.transform))
-                        continue;
-
-                    return true;
-                }
-            }
-
-            return false;
+            // If the held item is being pushed, it's effectively "touching" something.
+            return controller.IsPushedByWall || controller.IsPushedByGround;
         }
 
         private bool TryCleanTouching(ItemActionContext ctx)

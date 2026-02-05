@@ -21,7 +21,7 @@ MonoBehaviour:
     serializedVersion: 2
     m_Bits: 256
   touchCleanAmount: 0.1
-  scrubSoundPrefab: {fileID: 0}
+  scrubSoundPrefab: {fileID: 1060230473732666858, guid: e91aff8c936e2da4bb5626cb5b037eb5, type: 3}
   scrubSoundTouchMask:
     serializedVersion: 2
     m_Bits: 4294967295

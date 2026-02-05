@@ -91,8 +91,8 @@ public class SpongeCleanActionSO : ItemActionSO
             // Clean anything the sponge is currently touching (mask-driven).
             TryCleanTouching(ctx);
 
-            // Scrub sound while touching ANYTHING (mask-driven, defaults to Everything).
-            bool isTouchingAnything = IsTouchingAnything(ctx);
+            // Scrub sound while pushed by collision avoidance (wall or ground).
+            bool isTouchingAnything = IsPushedByEnvironment(ctx);
             TickScrubSound(ctx, isTouchingAnything);
 
             // Optional: same wiggle-trigger clean behavior as the broom file (yaw flips).
@@ -152,48 +152,14 @@ public class SpongeCleanActionSO : ItemActionSO
             Object.Instantiate(so.scrubSoundPrefab, pos, rot);
         }
 
-        private bool IsTouchingAnything(ItemActionContext ctx)
+        private static bool IsPushedByEnvironment(ItemActionContext ctx)
         {
             if (ctx.Held == null) return false;
-            if (so.scrubSoundTouchMask == 0) return false;
 
-            var heldColliders = ctx.Held.GetComponentsInChildren<Collider>();
-            if (heldColliders == null || heldColliders.Length == 0) return false;
+            var controller = Object.FindFirstObjectByType<PlayerPickupController>();
+            if (controller == null) return false;
 
-            Vector3 rootPos = ctx.Held.transform.position;
-            Quaternion rootRot = ctx.Held.transform.rotation;
-
-            for (int i = 0; i < heldColliders.Length; i++)
-            {
-                var c = heldColliders[i];
-                if (c == null) continue;
-                if (!c.enabled) continue;
-                if (c.isTrigger) continue;
-
-                Pose colliderPose = GetColliderWorldPoseAtTarget(c, rootPos, rootRot);
-                OrientedBox obb = GetColliderOrientedBoxAt(c, colliderPose.position, colliderPose.rotation);
-
-                var hits = Physics.OverlapBox(
-                    obb.center,
-                    obb.halfExtents,
-                    obb.rotation,
-                    so.scrubSoundTouchMask,
-                    QueryTriggerInteraction.Collide);
-
-                for (int h = 0; h < hits.Length; h++)
-                {
-                    var hit = hits[h];
-                    if (hit == null) continue;
-                    if (!hit.enabled) continue;
-
-                    if (hit.transform.IsChildOf(ctx.Held.transform))
-                        continue;
-
-                    return true;
-                }
-            }
-
-            return false;
+            return controller.IsPushedByWall || controller.IsPushedByGround;
         }
 
         private bool TryCleanTouching(ItemActionContext ctx)

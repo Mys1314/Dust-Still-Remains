@@ -108,6 +108,11 @@ public class PlayerPickupController : MonoBehaviour
     // NonAlloc overlap buffer
     private readonly Collider[] overlapBuffer = new Collider[64];
 
+    // Exposed flags for item actions (sounds/feedback).
+    // True if collision avoidance pushed the held item this frame.
+    public bool IsPushedByWall { get; private set; }
+    public bool IsPushedByGround { get; private set; }
+
     private void Awake()
     {
         if (!playerCamera) playerCamera = Camera.main;
@@ -333,6 +338,10 @@ public class PlayerPickupController : MonoBehaviour
     {
         if (heldRb == null) return;
 
+        // Reset per-step flags.
+        IsPushedByWall = false;
+        IsPushedByGround = false;
+
         GetHoldTargetPose(dt, out Vector3 targetPos, out Quaternion targetRot);
 
         // Apply persistent offsets
@@ -348,12 +357,27 @@ public class PlayerPickupController : MonoBehaviour
         Vector3 preSolve = candidatePos;
         bool corrected = ResolvePenetrations(ref candidatePos, finalRot);
 
+        // Record what kind of push happened (used by action SOs for sound).
+        if (corrected)
+        {
+            Vector3 delta = candidatePos - preSolve;
+            Vector3 deltaH = new Vector3(delta.x, 0f, delta.z);
+
+            // Any upward correction implies ground push.
+            if (delta.y > 0.0001f)
+                IsPushedByGround = true;
+
+            // Any horizontal correction implies wall push.
+            if (deltaH.sqrMagnitude > 1e-8f)
+                IsPushedByWall = true;
+        }
+
         // Move (kinematic)
         heldRb.MovePosition(candidatePos);
         heldRb.MoveRotation(finalRot);
 
         // How much did we get pushed this step?
-        Vector3 delta = candidatePos - preSolve;
+        Vector3 delta2 = candidatePos - preSolve;
 
         // Update offsets by COMPONENT so wall contacts don't "pin" the vertical offset.
         float followT = 1f - Mathf.Exp(-collisionOffsetFollow * dt);
@@ -362,9 +386,9 @@ public class PlayerPickupController : MonoBehaviour
 
         // --- Vertical (ground) offset ---
         // Only keep Y offset if we actually corrected upward this frame.
-        if (corrected && delta.y > 0.0001f)
+        if (corrected && delta2.y > 0.0001f)
         {
-            holdYOffset = Mathf.Lerp(holdYOffset, holdYOffset + delta.y, followT);
+            holdYOffset = Mathf.Lerp(holdYOffset, holdYOffset + delta2.y, followT);
         }
         else
         {
@@ -372,10 +396,10 @@ public class PlayerPickupController : MonoBehaviour
         }
 
         // --- Horizontal (wall) offset ---
-        Vector3 deltaH = new Vector3(delta.x, 0f, delta.z);
-        if (corrected && deltaH.sqrMagnitude > 1e-8f)
+        Vector3 deltaH2 = new Vector3(delta2.x, 0f, delta2.z);
+        if (corrected && deltaH2.sqrMagnitude > 1e-8f)
         {
-            holdHOffset = Vector3.Lerp(holdHOffset, holdHOffset + deltaH, followT);
+            holdHOffset = Vector3.Lerp(holdHOffset, holdHOffset + deltaH2, followT);
         }
         else
         {
