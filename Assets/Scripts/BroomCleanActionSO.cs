@@ -43,12 +43,25 @@ public class BroomCleanActionSO : ItemActionSO
     public float wiggleRollDegrees = 18f;
     public float wiggleSideMeters = 0.05f;
 
-    [Header("Held Collision Avoidance")]
-    [Tooltip("If the held broom overlaps colliders on this LayerMask, it will be pushed up/down (Y axis) until it no longer overlaps.")]
-    public LayerMask environmentMask;
+    [Header("Held Collision Avoidance (Simple)")]
+    [Tooltip("Step size used when pushing out of overlaps (meters per iteration).")]
+    [Min(0.0005f)]
+    public float resolveStep = 0.01f;
 
-    [Tooltip("Maximum absolute Y offset (meters) that can be applied to resolve overlaps.")]
+    [Tooltip("Broad LayerMask for environmental collision queries. Only layers in Wall/Ground masks will actually be resolved.")]
+    public LayerMask environmentMask = ~0;
+
+    [Tooltip("Layers treated as walls: penetration will be resolved by pushing along held local Z.")]
+    public LayerMask wallLayers;
+
+    [Tooltip("Layers treated as ground: penetration will be resolved by pushing along world Y.")]
+    public LayerMask groundLayers;
+
+    [Tooltip("Maximum absolute Y offset (meters) that can be applied to resolve overlaps with ground.")]
     public float maxResolveYOffset = 0.35f;
+
+    [Tooltip("Maximum absolute Z offset (meters) that can be applied to resolve overlaps with walls.")]
+    public float maxResolveZOffset = 0.35f;
 
     [Tooltip("How many iterations to try resolving overlaps per frame.")]
     [Range(1, 12)]
@@ -56,6 +69,14 @@ public class BroomCleanActionSO : ItemActionSO
 
     [Tooltip("Small extra distance to separate colliders after using ComputePenetration.")]
     public float resolveSkin = 0.002f;
+
+    [Header("Debug")]
+    [Tooltip("If enabled, draws overlap boxes used for environmental resolution in the Scene view.")]
+    public bool debugDrawResolveBoxes = false;
+
+    [Tooltip("Extra separation distance (meters) added when resolving overlaps. Helps prevent visible dipping/oscillation on shallow contacts.")]
+    [Min(0f)]
+    public float contactOffset = 0.01f;
 
     public override ItemActionInstance CreateInstance() => new Instance(this);
 
@@ -168,6 +189,10 @@ public class BroomCleanActionSO : ItemActionSO
             var heldColliders = ctx.Held.GetComponentsInChildren<Collider>();
             if (heldColliders == null || heldColliders.Length == 0) return false;
 
+            // Use current held pose.
+            Vector3 rootPos = ctx.Held.transform.position;
+            Quaternion rootRot = ctx.Held.transform.rotation;
+
             for (int i = 0; i < heldColliders.Length; i++)
             {
                 var c = heldColliders[i];
@@ -175,8 +200,10 @@ public class BroomCleanActionSO : ItemActionSO
                 if (!c.enabled) continue;
                 if (c.isTrigger) continue;
 
-                Bounds b = c.bounds;
-                var hits = Physics.OverlapBox(b.center, b.extents, c.transform.rotation, so.brushSoundTouchMask, QueryTriggerInteraction.Collide);
+                Pose colliderPose = GetColliderWorldPoseAtTarget(c, rootPos, rootRot);
+                OrientedBox obb = GetColliderOrientedBoxAt(c, colliderPose.position, colliderPose.rotation);
+
+                var hits = Physics.OverlapBox(obb.center, obb.halfExtents, obb.rotation, so.brushSoundTouchMask, QueryTriggerInteraction.Collide);
 
                 for (int h = 0; h < hits.Length; h++)
                 {
@@ -205,6 +232,10 @@ public class BroomCleanActionSO : ItemActionSO
             var heldColliders = ctx.Held.GetComponentsInChildren<Collider>();
             if (heldColliders == null || heldColliders.Length == 0) return false;
 
+            // Use current held pose.
+            Vector3 rootPos = ctx.Held.transform.position;
+            Quaternion rootRot = ctx.Held.transform.rotation;
+
             for (int i = 0; i < heldColliders.Length; i++)
             {
                 var c = heldColliders[i];
@@ -212,8 +243,10 @@ public class BroomCleanActionSO : ItemActionSO
                 if (!c.enabled) continue;
                 if (c.isTrigger) continue;
 
-                Bounds b = c.bounds;
-                var hits = Physics.OverlapBox(b.center, b.extents, c.transform.rotation, so.cleanableTouchMask, QueryTriggerInteraction.Collide);
+                Pose colliderPose = GetColliderWorldPoseAtTarget(c, rootPos, rootRot);
+                OrientedBox obb = GetColliderOrientedBoxAt(c, colliderPose.position, colliderPose.rotation);
+
+                var hits = Physics.OverlapBox(obb.center, obb.halfExtents, obb.rotation, so.cleanableTouchMask, QueryTriggerInteraction.Collide);
                 for (int h = 0; h < hits.Length; h++)
                 {
                     var hit = hits[h];
@@ -255,78 +288,19 @@ public class BroomCleanActionSO : ItemActionSO
             targetPos += ctx.HoldPoint.right * (s * so.wiggleSideMeters);
             // Roll (Z axis) instead of yaw (Y axis) for broom visual motion.
             targetRot = targetRot * Quaternion.Euler(0f, 0f, s * so.wiggleRollDegrees);
-
-            ResolveEnvironmentOverlap(ctx, ref targetPos, targetRot);
         }
 
-        private void ResolveEnvironmentOverlap(ItemActionContext ctx, ref Vector3 targetPos, Quaternion targetRot)
+        private readonly struct OrientedBox
         {
-            if (so.environmentMask == 0) return;
-            if (ctx.Held == null) return;
+            public readonly Vector3 center;
+            public readonly Vector3 halfExtents;
+            public readonly Quaternion rotation;
 
-            var heldColliders = ctx.Held.GetComponentsInChildren<Collider>();
-            if (heldColliders == null || heldColliders.Length == 0) return;
-
-            float accumulatedY = 0f;
-
-            for (int iter = 0; iter < so.resolveIterations; iter++)
+            public OrientedBox(Vector3 center, Vector3 halfExtents, Quaternion rotation)
             {
-                bool anyPenetration = false;
-                float requiredStepY = 0f;
-
-                for (int i = 0; i < heldColliders.Length; i++)
-                {
-                    var c = heldColliders[i];
-                    if (c == null) continue;
-                    if (!c.enabled) continue;
-                    if (c.isTrigger) continue;
-
-                    Pose colliderPose = GetColliderWorldPoseAtTarget(c, targetPos, targetRot);
-
-                    Bounds b = GetColliderBoundsAtTarget(c, colliderPose.position, colliderPose.rotation);
-                    var envHits = Physics.OverlapBox(b.center, b.extents, colliderPose.rotation, so.environmentMask, QueryTriggerInteraction.Ignore);
-
-                    for (int h = 0; h < envHits.Length; h++)
-                    {
-                        var env = envHits[h];
-                        if (env == null) continue;
-                        if (!env.enabled) continue;
-                        if (env.isTrigger) continue;
-
-                        if (Physics.ComputePenetration(
-                                c, colliderPose.position, colliderPose.rotation,
-                                env, env.transform.position, env.transform.rotation,
-                                out Vector3 direction, out float distance))
-                        {
-                            anyPenetration = true;
-
-                            float rel = colliderPose.position.y - env.bounds.center.y;
-                            float sign = rel < 0f ? -1f : 1f;
-
-                            float dy = sign * Mathf.Abs(direction.y) * (distance + so.resolveSkin);
-
-                            if (Mathf.Abs(dy) < 1e-5f)
-                                dy = sign * (distance + so.resolveSkin);
-
-                            if (Mathf.Abs(dy) > Mathf.Abs(requiredStepY))
-                                requiredStepY = dy;
-                        }
-                    }
-                }
-
-                if (!anyPenetration)
-                    break;
-
-                float nextAccum = accumulatedY + requiredStepY;
-                if (Mathf.Abs(nextAccum) > so.maxResolveYOffset)
-                {
-                    requiredStepY = Mathf.Sign(nextAccum) * so.maxResolveYOffset - accumulatedY;
-                    targetPos.y += requiredStepY;
-                    break;
-                }
-
-                accumulatedY = nextAccum;
-                targetPos.y += requiredStepY;
+                this.center = center;
+                this.halfExtents = halfExtents;
+                this.rotation = rotation;
             }
         }
 
@@ -345,43 +319,80 @@ public class BroomCleanActionSO : ItemActionSO
                 targetRootRot * localRot);
         }
 
-        private static Bounds GetColliderBoundsAtTarget(Collider c, Vector3 worldPos, Quaternion worldRot)
+        private static OrientedBox GetColliderOrientedBoxAt(Collider c, Vector3 worldPos, Quaternion worldRot)
         {
+            Vector3 scale = GetApproxTargetScale(c);
+
             if (c is BoxCollider bc)
             {
-                Vector3 size = Vector3.Scale(bc.size, bc.transform.lossyScale);
-                var bounds = new Bounds(worldPos + (worldRot * Vector3.Scale(bc.center, bc.transform.lossyScale)), size);
-                bounds.Expand(0.01f);
-                return bounds;
+                Vector3 scaledCenter = Vector3.Scale(bc.center, scale);
+                Vector3 scaledSize = Vector3.Scale(bc.size, new Vector3(Mathf.Abs(scale.x), Mathf.Abs(scale.y), Mathf.Abs(scale.z)));
+                Vector3 half = scaledSize * 0.5f;
+
+                return new OrientedBox(worldPos + (worldRot * scaledCenter), half, worldRot);
             }
 
             if (c is SphereCollider sc)
             {
-                float maxScale = Mathf.Max(Mathf.Abs(sc.transform.lossyScale.x), Mathf.Abs(sc.transform.lossyScale.y), Mathf.Abs(sc.transform.lossyScale.z));
-                float r = sc.radius * maxScale;
-                var bounds = new Bounds(worldPos + (worldRot * Vector3.Scale(sc.center, sc.transform.lossyScale)), Vector3.one * (2f * r));
-                bounds.Expand(0.01f);
-                return bounds;
+                float max = Mathf.Max(Mathf.Abs(scale.x), Mathf.Abs(scale.y), Mathf.Abs(scale.z));
+                float r = sc.radius * max;
+                Vector3 scaledCenter = Vector3.Scale(sc.center, scale);
+
+                return new OrientedBox(worldPos + (worldRot * scaledCenter), Vector3.one * r, worldRot);
             }
 
             if (c is CapsuleCollider cc)
             {
-                Vector3 s = cc.transform.lossyScale;
-                float radiusScale = Mathf.Max(Mathf.Abs(s.x), Mathf.Abs(s.z));
+                float radiusScale;
+                float heightScale;
+                Vector3 abs = new Vector3(Mathf.Abs(scale.x), Mathf.Abs(scale.y), Mathf.Abs(scale.z));
+
+                switch (cc.direction)
+                {
+                    case 0: // X
+                        radiusScale = Mathf.Max(abs.y, abs.z);
+                        heightScale = abs.x;
+                        break;
+                    case 2: // Z
+                        radiusScale = Mathf.Max(abs.x, abs.y);
+                        heightScale = abs.z;
+                        break;
+                    default: // Y
+                        radiusScale = Mathf.Max(abs.x, abs.z);
+                        heightScale = abs.y;
+                        break;
+                }
+
                 float r = cc.radius * radiusScale;
-                float h = Mathf.Abs(cc.height * s.y);
+                float h = Mathf.Max(cc.height * heightScale, 2f * r);
 
-                float extentY = Mathf.Max(h * 0.5f, r);
-                float extentXZ = r;
+                Vector3 half;
+                switch (cc.direction)
+                {
+                    case 0:
+                        half = new Vector3(h * 0.5f, r, r);
+                        break;
+                    case 2:
+                        half = new Vector3(r, r, h * 0.5f);
+                        break;
+                    default:
+                        half = new Vector3(r, h * 0.5f, r);
+                        break;
+                }
 
-                var bounds = new Bounds(worldPos + (worldRot * Vector3.Scale(cc.center, s)), new Vector3(extentXZ * 2f, extentY * 2f, extentXZ * 2f));
-                bounds.Expand(0.02f);
-                return bounds;
+                Vector3 scaledCenter = Vector3.Scale(cc.center, scale);
+                return new OrientedBox(worldPos + (worldRot * scaledCenter), half, worldRot);
             }
 
-            var b = c.bounds;
-            b.Expand(0.05f);
-            return b;
+            Bounds b = c.bounds;
+            return new OrientedBox(b.center, b.extents, c.transform.rotation);
+        }
+
+        private static Vector3 GetApproxTargetScale(Collider c)
+        {
+            // For held objects we assume scale stays consistent; use current transform scale.
+            // (This avoids incorrect math from earlier target-rotation scale estimation.)
+            return c.transform.lossyScale;
         }
     }
 }

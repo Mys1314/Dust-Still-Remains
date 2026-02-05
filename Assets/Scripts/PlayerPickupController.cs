@@ -16,26 +16,52 @@ public class PlayerPickupController : MonoBehaviour
 
     [Header("Holding")]
     [SerializeField] private Transform holdPoint;
+
+    [Tooltip("Higher = snappier follow. Typical 12-30.")]
     [SerializeField] private float followSmooth = 20f;
-    [SerializeField] private bool matchHoldRotation = true;
 
-    [Header("Holding Collision Avoidance")]
-    [Tooltip("If the held item overlaps colliders on this LayerMask, it will be pushed up/down (Y axis) until it no longer overlaps.")]
-    [SerializeField] private LayerMask environmentMask;
+    [Tooltip("If true, held rotation follows the hold pose. If false, rotation is locked to pickup rotation.")]
+    [SerializeField] private bool matchHoldRotation = false;
 
-    [Tooltip("Maximum absolute Y offset (meters) that can be applied to resolve overlaps.")]
-    [SerializeField] private float maxResolveYOffset = 0.35f;
+    [Header("Collision Avoidance (ONE place only)")]
+    [Tooltip("Only the layers you want the held item to NOT overlap (usually Ground + Wall). Do NOT include Player or Pickup layers.")]
+    [SerializeField] private LayerMask environmentMask = 0;
 
-    [Tooltip("How many iterations to try resolving overlaps per frame.")]
-    [SerializeField, Range(1, 12)] private int resolveIterations = 6;
+    [SerializeField, Range(1, 12)] private int penetrationIterations = 6;
 
-    [Tooltip("Small extra distance to separate colliders after using ComputePenetration.")]
-    [SerializeField] private float resolveSkin = 0.002f;
+    [Tooltip("Extra separation distance after ComputePenetration (meters).")]
+    [SerializeField, Min(0f)] private float penetrationSkin = 0.002f;
+
+    [Tooltip("Small extra spacing to reduce visible jitter (meters).")]
+    [SerializeField, Min(0f)] private float contactOffset = 0.004f;
+
+    [Tooltip("How fast the persistent collision offset updates.")]
+    [SerializeField, Min(1f)] private float collisionOffsetFollow = 25f;
+
+    [Tooltip("How fast the offset relaxes back to zero when no longer colliding.")]
+    [SerializeField, Min(0.1f)] private float collisionOffsetRelax = 6f;
+
+    [Tooltip("Max horizontal (XZ) collision offset magnitude.")]
+    [SerializeField, Min(0f)] private float maxResolveHorizontal = 0.30f;
+
+    [Tooltip("Max vertical (Y) collision offset magnitude.")]
+    [SerializeField, Min(0f)] private float maxResolveVertical = 0.30f;
+
+    [Header("Debug")]
+    [SerializeField] private bool debugDrawResolveBoxes = false;
 
     [Header("UI Prompt")]
-    [SerializeField] private GameObject promptRoot;   // enable/disable this GO
-    [SerializeField] private TMP_Text promptText;     // TMP component
+    [SerializeField] private GameObject promptRoot;
+    [SerializeField] private TMP_Text promptText;
     [SerializeField] private string pickUpPrompt = "Press E to pick up";
+
+    [Header("Offset Relax (prevents mid-air sticking)")]
+    [SerializeField, Min(0.1f)] private float verticalOffsetRelax = 25f;
+    [SerializeField, Min(0.1f)] private float horizontalOffsetRelax = 10f;
+
+    private float holdYOffset;      // persistent ground correction only
+    private Vector3 holdHOffset;    // persistent wall correction only (XZ)
+
 
     private bool promptVisible;
 
@@ -43,8 +69,8 @@ public class PlayerPickupController : MonoBehaviour
     private Pickupable held;
 
     private Rigidbody heldRb;
-    private Collider[] heldColliders;
     private Collider[] playerColliders;
+    private Collider[] heldColliders;
 
     private ItemActionInstance heldActionInstance;
     private bool isUsing;
@@ -52,10 +78,35 @@ public class PlayerPickupController : MonoBehaviour
     private float lastCamYaw;
     private float camYawDeltaThisFrame;
 
-    // Offsets derived from the held item's HoldPose anchor.
-    // These are applied so that the anchor exactly matches the holdPoint.
+    // HoldPose offsets
     private Quaternion holdRotationOffset = Quaternion.identity;
     private Vector3 holdPositionOffsetLocal = Vector3.zero;
+
+    // Locked rotation when matchHoldRotation == false
+    private Quaternion lockedRotation = Quaternion.identity;
+
+    // Persistent collision correction
+    private Vector3 holdCollisionOffset = Vector3.zero;
+    private int framesWithoutCorrection = 0;
+
+    // Cached RB settings to restore on drop
+    private bool savedKinematic;
+    private bool savedUseGravity;
+    private RigidbodyInterpolation savedInterpolation;
+    private CollisionDetectionMode savedCollisionMode;
+    private RigidbodyConstraints savedConstraints;
+
+    // Cache collider local poses relative to held root (more stable than recomputing each frame)
+    private struct HeldColPose
+    {
+        public Collider col;
+        public Vector3 localPos;
+        public Quaternion localRot;
+    }
+    private HeldColPose[] heldColPoses;
+
+    // NonAlloc overlap buffer
+    private readonly Collider[] overlapBuffer = new Collider[64];
 
     private void Awake()
     {
@@ -63,7 +114,6 @@ public class PlayerPickupController : MonoBehaviour
         playerColliders = GetComponentsInChildren<Collider>();
 
         lastCamYaw = playerCamera.transform.eulerAngles.y;
-
         SetPrompt(false);
     }
 
@@ -112,14 +162,16 @@ public class PlayerPickupController : MonoBehaviour
         {
             lookedAt = null;
             SetPrompt(false);
-            heldActionInstance?.Tick(BuildCtx());
+
+            // action logic (input driven)
+            heldActionInstance?.Tick(BuildCtx(Time.deltaTime));
         }
     }
 
-    private void LateUpdate()
+    private void FixedUpdate()
     {
         if (held != null)
-            MoveHeldObject();
+            StepHeld(Time.fixedDeltaTime);
     }
 
     private void UpdateCameraYawDelta()
@@ -181,7 +233,6 @@ public class PlayerPickupController : MonoBehaviour
     {
         if (held == null) return;
 
-        // No ScriptableObject attached => default throw
         if (heldActionInstance == null)
         {
             Throw();
@@ -189,7 +240,7 @@ public class PlayerPickupController : MonoBehaviour
         }
 
         isUsing = true;
-        heldActionInstance.OnUseStarted(BuildCtx());
+        heldActionInstance.OnUseStarted(BuildCtx(Time.deltaTime));
     }
 
     private void OnUseCanceled(InputAction.CallbackContext ctx)
@@ -198,26 +249,71 @@ public class PlayerPickupController : MonoBehaviour
         if (heldActionInstance == null) return;
 
         isUsing = false;
-        heldActionInstance.OnUseCanceled(BuildCtx());
+        heldActionInstance.OnUseCanceled(BuildCtx(Time.deltaTime));
     }
 
     private void Pickup(Pickupable p)
     {
         held = p;
         heldRb = p.Rb;
+        holdYOffset = 0f;
+        holdHOffset = Vector3.zero;
+
+
+        if (heldRb == null)
+        {
+            Debug.LogError("Pickupable has no Rigidbody on the root. Add a Rigidbody to the held object's root.");
+            held = null;
+            return;
+        }
 
         ComputeHoldOffsets();
 
+        lockedRotation = heldRb.rotation;
+
+        // cache rb state
+        savedKinematic = heldRb.isKinematic;
+        savedUseGravity = heldRb.useGravity;
+        savedInterpolation = heldRb.interpolation;
+        savedCollisionMode = heldRb.collisionDetectionMode;
+        savedConstraints = heldRb.constraints;
+
+        // while held
         heldRb.isKinematic = true;
         heldRb.useGravity = false;
+        heldRb.interpolation = RigidbodyInterpolation.Interpolate;
+        heldRb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
+        heldRb.constraints = RigidbodyConstraints.FreezeRotation;
 
+        // Cache colliders + local poses
         heldColliders = held.GetComponentsInChildren<Collider>();
+        heldColPoses = new HeldColPose[heldColliders.Length];
+        for (int i = 0; i < heldColliders.Length; i++)
+        {
+            var c = heldColliders[i];
+            heldColPoses[i] = new HeldColPose
+            {
+                col = c,
+                localPos = held.transform.InverseTransformPoint(c.transform.position),
+                localRot = Quaternion.Inverse(held.transform.rotation) * c.transform.rotation
+            };
+        }
+
+        // Ignore collisions with player
         foreach (var hc in heldColliders)
             foreach (var pc in playerColliders)
                 if (hc && pc) Physics.IgnoreCollision(hc, pc, true);
 
+        holdCollisionOffset = Vector3.zero;
+        framesWithoutCorrection = 0;
+
         EquipHeldAction();
         SetPrompt(false);
+
+        // snap once
+        GetHoldTargetPose(Time.fixedDeltaTime, out Vector3 snapPos, out Quaternion snapRot);
+        heldRb.position = snapPos;
+        heldRb.rotation = matchHoldRotation ? snapRot : lockedRotation;
     }
 
     private void EquipHeldAction()
@@ -229,159 +325,263 @@ public class PlayerPickupController : MonoBehaviour
         if (provider != null && provider.leftClickAction != null)
         {
             heldActionInstance = provider.leftClickAction.CreateInstance();
-            heldActionInstance.OnEquip(BuildCtx());
+            heldActionInstance.OnEquip(BuildCtx(Time.deltaTime));
         }
     }
 
-    private void MoveHeldObject()
+    private void StepHeld(float dt)
     {
-        float t = 1f - Mathf.Exp(-followSmooth * Time.deltaTime);
+        if (heldRb == null) return;
 
+        GetHoldTargetPose(dt, out Vector3 targetPos, out Quaternion targetRot);
+
+        // Apply persistent offsets
+        Vector3 desiredPos = targetPos + holdHOffset + new Vector3(0f, holdYOffset, 0f);
+
+        float t = 1f - Mathf.Exp(-followSmooth * dt);
+        Vector3 prevPos = heldRb.position;
+        Vector3 candidatePos = Vector3.Lerp(prevPos, desiredPos, t);
+
+        Quaternion finalRot = matchHoldRotation ? targetRot : lockedRotation;
+
+        // Solve penetrations
+        Vector3 preSolve = candidatePos;
+        bool corrected = ResolvePenetrations(ref candidatePos, finalRot);
+
+        // Move (kinematic)
+        heldRb.MovePosition(candidatePos);
+        heldRb.MoveRotation(finalRot);
+
+        // How much did we get pushed this step?
+        Vector3 delta = candidatePos - preSolve;
+
+        // Update offsets by COMPONENT so wall contacts don't "pin" the vertical offset.
+        float followT = 1f - Mathf.Exp(-collisionOffsetFollow * dt);
+        float relaxVT = 1f - Mathf.Exp(-verticalOffsetRelax * dt);
+        float relaxHT = 1f - Mathf.Exp(-horizontalOffsetRelax * dt);
+
+        // --- Vertical (ground) offset ---
+        // Only keep Y offset if we actually corrected upward this frame.
+        if (corrected && delta.y > 0.0001f)
+        {
+            holdYOffset = Mathf.Lerp(holdYOffset, holdYOffset + delta.y, followT);
+        }
+        else
+        {
+            holdYOffset = Mathf.Lerp(holdYOffset, 0f, relaxVT);
+        }
+
+        // --- Horizontal (wall) offset ---
+        Vector3 deltaH = new Vector3(delta.x, 0f, delta.z);
+        if (corrected && deltaH.sqrMagnitude > 1e-8f)
+        {
+            holdHOffset = Vector3.Lerp(holdHOffset, holdHOffset + deltaH, followT);
+        }
+        else
+        {
+            holdHOffset = Vector3.Lerp(holdHOffset, Vector3.zero, relaxHT);
+        }
+
+        // Clamp offsets
+        if (holdHOffset.magnitude > maxResolveHorizontal && holdHOffset.sqrMagnitude > 1e-8f)
+            holdHOffset = holdHOffset.normalized * maxResolveHorizontal;
+
+        holdYOffset = Mathf.Clamp(holdYOffset, -maxResolveVertical, maxResolveVertical);
+    }
+
+    private void GetHoldTargetPose(float dt, out Vector3 targetPos, out Quaternion targetRot)
+    {
         Quaternion baseRot = holdPoint.rotation;
         Vector3 basePos = holdPoint.position;
 
-        // Apply offsets so the item's anchor matches the hold point.
-        Quaternion targetRot = baseRot * holdRotationOffset;
-        Vector3 targetPos = basePos + (targetRot * holdPositionOffsetLocal);
+        targetRot = baseRot * holdRotationOffset;
+        targetPos = basePos + (targetRot * holdPositionOffsetLocal);
 
-        // Allow action to add visual offsets (wiggle, sway) before we resolve collision.
-        heldActionInstance?.ModifyHoldTarget(BuildCtx(), ref targetPos, ref targetRot);
+        // IMPORTANT:
+        // The action should ONLY do visual offsets (wiggle), NOT collision solving.
+        heldActionInstance?.ModifyHoldTarget(BuildCtx(dt), ref targetPos, ref targetRot);
 
-        // Prevent held items from being placed inside environment geometry.
-        ResolveEnvironmentOverlap(ref targetPos, targetRot);
-
-        held.transform.position = Vector3.Lerp(held.transform.position, targetPos, t);
-
-        if (matchHoldRotation)
-            held.transform.rotation = Quaternion.Slerp(held.transform.rotation, targetRot, t);
+        if (!matchHoldRotation)
+            targetRot = lockedRotation;
     }
 
-    private void ResolveEnvironmentOverlap(ref Vector3 targetPos, Quaternion targetRot)
+    private bool ResolvePenetrations(ref Vector3 rootPos, Quaternion rootRot)
     {
-        if (environmentMask == 0) return;
-        if (held == null) return;
+        if (environmentMask == 0) return false;
+        if (heldColPoses == null || heldColPoses.Length == 0) return false;
 
-        // Cache colliders if possible.
-        if (heldColliders == null || heldColliders.Length == 0)
-            heldColliders = held.GetComponentsInChildren<Collider>();
+        bool correctedAny = false;
 
-        if (heldColliders == null || heldColliders.Length == 0) return;
-
-        float accumulatedY = 0f;
-
-        for (int iter = 0; iter < resolveIterations; iter++)
+        for (int iter = 0; iter < penetrationIterations; iter++)
         {
-            bool anyPenetration = false;
-            float requiredStepY = 0f;
+            bool anyThisIter = false;
+            Vector3 bestMove = Vector3.zero;
 
-            for (int i = 0; i < heldColliders.Length; i++)
+            for (int i = 0; i < heldColPoses.Length; i++)
             {
-                var c = heldColliders[i];
-                if (c == null) continue;
-                if (!c.enabled) continue;
-                if (c.isTrigger) continue;
+                Collider c = heldColPoses[i].col;
+                if (c == null || !c.enabled || c.isTrigger) continue;
 
-                Pose colliderPose = GetColliderWorldPoseAtTarget(held.transform, c.transform, targetPos, targetRot);
-                Bounds b = GetBroadphaseBoundsAtTarget(c, colliderPose.position, colliderPose.rotation);
+                Vector3 colWorldPos = rootPos + (rootRot * heldColPoses[i].localPos);
+                Quaternion colWorldRot = rootRot * heldColPoses[i].localRot;
 
-                var envHits = Physics.OverlapBox(b.center, b.extents, colliderPose.rotation, environmentMask, QueryTriggerInteraction.Ignore);
-                for (int h = 0; h < envHits.Length; h++)
+                OrientedBox obb = GetColliderOrientedBoxAt(c, colWorldPos, colWorldRot);
+
+                if (debugDrawResolveBoxes)
+                    DrawOrientedBox(obb, Color.yellow, 0f);
+
+                int hitCount = Physics.OverlapBoxNonAlloc(
+                    obb.center, obb.halfExtents, overlapBuffer, obb.rotation,
+                    environmentMask, QueryTriggerInteraction.Ignore);
+
+                for (int h = 0; h < hitCount; h++)
                 {
-                    var env = envHits[h];
-                    if (env == null) continue;
-                    if (!env.enabled) continue;
-                    if (env.isTrigger) continue;
+                    var env = overlapBuffer[h];
+                    if (env == null || !env.enabled || env.isTrigger) continue;
+                    if (env.transform.IsChildOf(held.transform)) continue;
 
-                    if (Physics.ComputePenetration(
-                            c, colliderPose.position, colliderPose.rotation,
-                            env, env.transform.position, env.transform.rotation,
-                            out Vector3 direction, out float distance))
+                    // ignore player colliders even if mask is wrong
+                    if (playerColliders != null)
                     {
-                        anyPenetration = true;
-
-                        // Choose up/down based on relative position to the thing we hit.
-                        float rel = colliderPose.position.y - env.bounds.center.y;
-                        float sign = rel < 0f ? -1f : 1f;
-
-                        float dy = sign * Mathf.Abs(direction.y) * (distance + resolveSkin);
-                        if (Mathf.Abs(dy) < 1e-5f)
-                            dy = sign * (distance + resolveSkin);
-
-                        if (Mathf.Abs(dy) > Mathf.Abs(requiredStepY))
-                            requiredStepY = dy;
+                        bool isPlayer = false;
+                        for (int pc = 0; pc < playerColliders.Length; pc++)
+                        {
+                            if (env == playerColliders[pc]) { isPlayer = true; break; }
+                        }
+                        if (isPlayer) continue;
                     }
+
+                    if (!Physics.ComputePenetration(
+                        c, colWorldPos, colWorldRot,
+                        env, env.transform.position, env.transform.rotation,
+                        out Vector3 dir, out float dist))
+                        continue;
+
+                    anyThisIter = true;
+                    Vector3 move = dir * (dist + penetrationSkin + contactOffset);
+
+                    if (move.sqrMagnitude > bestMove.sqrMagnitude)
+                        bestMove = move;
                 }
             }
 
-            if (!anyPenetration)
+            if (!anyThisIter)
                 break;
 
-            float nextAccum = accumulatedY + requiredStepY;
-            if (Mathf.Abs(nextAccum) > maxResolveYOffset)
-            {
-                requiredStepY = Mathf.Sign(nextAccum) * maxResolveYOffset - accumulatedY;
-                targetPos.y += requiredStepY;
-                break;
-            }
+            correctedAny = true;
+            rootPos += bestMove;
+        }
 
-            accumulatedY = nextAccum;
-            targetPos.y += requiredStepY;
+        return correctedAny;
+    }
+
+    private readonly struct OrientedBox
+    {
+        public readonly Vector3 center;
+        public readonly Vector3 halfExtents;
+        public readonly Quaternion rotation;
+
+        public OrientedBox(Vector3 center, Vector3 halfExtents, Quaternion rotation)
+        {
+            this.center = center;
+            this.halfExtents = halfExtents;
+            this.rotation = rotation;
         }
     }
 
-    private static Pose GetColliderWorldPoseAtTarget(Transform heldRoot, Transform colliderTransform, Vector3 targetRootPos, Quaternion targetRootRot)
+    private static OrientedBox GetColliderOrientedBoxAt(Collider c, Vector3 worldPos, Quaternion worldRot)
     {
-        // Compute collider local pose relative to the held root, then apply to target root pose.
-        Vector3 localPos = heldRoot.InverseTransformPoint(colliderTransform.position);
-        Quaternion localRot = Quaternion.Inverse(heldRoot.rotation) * colliderTransform.rotation;
+        Vector3 scale = c.transform.lossyScale;
+        Vector3 absScale = new Vector3(Mathf.Abs(scale.x), Mathf.Abs(scale.y), Mathf.Abs(scale.z));
 
-        return new Pose(
-            targetRootPos + (targetRootRot * localPos),
-            targetRootRot * localRot);
-    }
-
-    private static Bounds GetBroadphaseBoundsAtTarget(Collider c, Vector3 worldPos, Quaternion worldRot)
-    {
-        // Conservative bounds used to find nearby environment colliders.
         if (c is BoxCollider bc)
         {
-            Vector3 scaledCenter = Vector3.Scale(bc.center, bc.transform.lossyScale);
-            Vector3 size = Vector3.Scale(bc.size, bc.transform.lossyScale);
-            var bounds = new Bounds(worldPos + (worldRot * scaledCenter), size);
-            bounds.Expand(0.01f);
-            return bounds;
+            Vector3 scaledCenter = Vector3.Scale(bc.center, scale);
+            Vector3 scaledSize = Vector3.Scale(bc.size, absScale);
+            Vector3 half = scaledSize * 0.5f;
+            return new OrientedBox(worldPos + (worldRot * scaledCenter), half, worldRot);
         }
 
         if (c is SphereCollider sc)
         {
-            Vector3 scaledCenter = Vector3.Scale(sc.center, sc.transform.lossyScale);
-            float maxScale = Mathf.Max(Mathf.Abs(sc.transform.lossyScale.x), Mathf.Abs(sc.transform.lossyScale.y), Mathf.Abs(sc.transform.lossyScale.z));
-            float r = sc.radius * maxScale;
-            var bounds = new Bounds(worldPos + (worldRot * scaledCenter), Vector3.one * (2f * r));
-            bounds.Expand(0.01f);
-            return bounds;
+            float max = Mathf.Max(absScale.x, absScale.y, absScale.z);
+            float r = sc.radius * max;
+            Vector3 scaledCenter = Vector3.Scale(sc.center, scale);
+            return new OrientedBox(worldPos + (worldRot * scaledCenter), Vector3.one * r, worldRot);
         }
 
         if (c is CapsuleCollider cc)
         {
-            Vector3 s = cc.transform.lossyScale;
-            Vector3 scaledCenter = Vector3.Scale(cc.center, s);
+            float radiusScale;
+            float heightScale;
 
-            float radiusScale = Mathf.Max(Mathf.Abs(s.x), Mathf.Abs(s.z));
+            switch (cc.direction)
+            {
+                case 0: radiusScale = Mathf.Max(absScale.y, absScale.z); heightScale = absScale.x; break; // X
+                case 2: radiusScale = Mathf.Max(absScale.x, absScale.y); heightScale = absScale.z; break; // Z
+                default: radiusScale = Mathf.Max(absScale.x, absScale.z); heightScale = absScale.y; break; // Y
+            }
+
             float r = cc.radius * radiusScale;
-            float h = Mathf.Abs(cc.height * s.y);
+            float h = Mathf.Max(cc.height * heightScale, 2f * r);
 
-            float extentY = Mathf.Max(h * 0.5f, r);
-            float extentXZ = r;
+            Vector3 half;
+            switch (cc.direction)
+            {
+                case 0: half = new Vector3(h * 0.5f, r, r); break;
+                case 2: half = new Vector3(r, r, h * 0.5f); break;
+                default: half = new Vector3(r, h * 0.5f, r); break;
+            }
 
-            var bounds = new Bounds(worldPos + (worldRot * scaledCenter), new Vector3(extentXZ * 2f, extentY * 2f, extentXZ * 2f));
-            bounds.Expand(0.02f);
-            return bounds;
+            Vector3 scaledCenter = Vector3.Scale(cc.center, scale);
+            return new OrientedBox(worldPos + (worldRot * scaledCenter), half, worldRot);
         }
 
-        var b = c.bounds;
-        b.Expand(0.05f);
-        return b;
+        // IMPORTANT FIX: MeshCollider must use sharedMesh.bounds (local OBB), NOT c.bounds (world AABB).
+        if (c is MeshCollider mc && mc.sharedMesh != null)
+        {
+            Bounds mb = mc.sharedMesh.bounds; // local space
+            Vector3 scaledCenter = Vector3.Scale(mb.center, scale);
+            Vector3 scaledExtents = Vector3.Scale(mb.extents, absScale);
+            return new OrientedBox(worldPos + (worldRot * scaledCenter), scaledExtents, worldRot);
+        }
+
+        // Fallback (rare). Uses world AABB (less stable).
+        Bounds b = c.bounds;
+        return new OrientedBox(b.center, b.extents, Quaternion.identity);
+    }
+
+    private static void DrawOrientedBox(OrientedBox b, Color color, float duration)
+    {
+        Vector3 ex = b.rotation * new Vector3(b.halfExtents.x, 0f, 0f);
+        Vector3 ey = b.rotation * new Vector3(0f, b.halfExtents.y, 0f);
+        Vector3 ez = b.rotation * new Vector3(0f, 0f, b.halfExtents.z);
+
+        Vector3 c = b.center;
+
+        Vector3 p000 = c - ex - ey - ez;
+        Vector3 p001 = c - ex - ey + ez;
+        Vector3 p010 = c - ex + ey - ez;
+        Vector3 p011 = c - ex + ey + ez;
+        Vector3 p100 = c + ex - ey - ez;
+        Vector3 p101 = c + ex - ey + ez;
+        Vector3 p110 = c + ex + ey - ez;
+        Vector3 p111 = c + ex + ey + ez;
+
+        Debug.DrawLine(p000, p001, color, duration);
+        Debug.DrawLine(p001, p011, color, duration);
+        Debug.DrawLine(p011, p010, color, duration);
+        Debug.DrawLine(p010, p000, color, duration);
+
+        Debug.DrawLine(p100, p101, color, duration);
+        Debug.DrawLine(p101, p111, color, duration);
+        Debug.DrawLine(p111, p110, color, duration);
+        Debug.DrawLine(p110, p100, color, duration);
+
+        Debug.DrawLine(p000, p100, color, duration);
+        Debug.DrawLine(p001, p101, color, duration);
+        Debug.DrawLine(p010, p110, color, duration);
+        Debug.DrawLine(p011, p111, color, duration);
     }
 
     private void ComputeHoldOffsets()
@@ -393,16 +593,9 @@ public class PlayerPickupController : MonoBehaviour
 
         var pose = held.GetComponentInParent<HoldPose>();
         if (pose == null || pose.holdAnchor == null)
-            return; // No hold pose -> default behavior (match holdPoint exactly)
+            return;
 
-        // We want the anchor orientation to match the holdPoint orientation.
-        // Setting targetRot = holdPoint.rotation * inverse(anchorLocalRotation)
-        // makes the anchor's world rotation equal to holdPoint.rotation.
         holdRotationOffset = Quaternion.Inverse(pose.holdAnchor.localRotation);
-
-        // For position, we want anchor world position to land on holdPoint.position.
-        // In our formulation: targetPos = holdPoint.position + targetRot * holdPositionOffsetLocal
-        // choose holdPositionOffsetLocal = -anchorLocalPos.
         holdPositionOffsetLocal = -pose.holdAnchor.localPosition;
     }
 
@@ -414,41 +607,57 @@ public class PlayerPickupController : MonoBehaviour
         if (held == null) return;
 
         isUsing = false;
+        holdYOffset = 0f;
+        holdHOffset = Vector3.zero;
 
-        heldActionInstance?.OnUnequip(BuildCtx());
+
+        heldActionInstance?.OnUnequip(BuildCtx(Time.deltaTime));
         heldActionInstance = null;
 
-        foreach (var hc in heldColliders)
-            foreach (var pc in playerColliders)
-                if (hc && pc) Physics.IgnoreCollision(hc, pc, false);
-
-        heldRb.isKinematic = false;
-        heldRb.useGravity = true;
-
-        heldRb.linearVelocity = Vector3.zero;
-        heldRb.angularVelocity = Vector3.zero;
-
-        if (applyThrow)
+        if (heldColliders != null)
         {
-            Vector3 dir = playerCamera.transform.forward;
-            heldRb.AddForce(dir * throwForce, ForceMode.VelocityChange);
+            foreach (var hc in heldColliders)
+                foreach (var pc in playerColliders)
+                    if (hc && pc) Physics.IgnoreCollision(hc, pc, false);
+        }
+
+        // Restore RB state
+        if (heldRb != null)
+        {
+            heldRb.isKinematic = savedKinematic;
+            heldRb.useGravity = savedUseGravity;
+            heldRb.interpolation = savedInterpolation;
+            heldRb.collisionDetectionMode = savedCollisionMode;
+            heldRb.constraints = savedConstraints;
+
+            heldRb.linearVelocity = Vector3.zero;
+            heldRb.angularVelocity = Vector3.zero;
+
+            if (applyThrow)
+            {
+                Vector3 dir = playerCamera != null ? playerCamera.transform.forward : transform.forward;
+                heldRb.AddForce(dir * throwForce, ForceMode.VelocityChange);
+            }
         }
 
         held = null;
         heldRb = null;
         heldColliders = null;
+        heldColPoses = null;
 
         holdRotationOffset = Quaternion.identity;
         holdPositionOffsetLocal = Vector3.zero;
+        holdCollisionOffset = Vector3.zero;
+        framesWithoutCorrection = 0;
     }
 
-    private ItemActionContext BuildCtx()
+    private ItemActionContext BuildCtx(float dt)
     {
         return new ItemActionContext(
             playerCamera,
             holdPoint,
             held,
-            Time.deltaTime,
+            dt,
             Time.time,
             camYawDeltaThisFrame,
             isUsing

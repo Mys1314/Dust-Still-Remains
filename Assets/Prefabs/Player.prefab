@@ -163,7 +163,7 @@ Transform:
   m_GameObject: {fileID: 3602917210270963054}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: -0.2, z: 1.2}
+  m_LocalPosition: {x: 0.25, y: -0.2, z: 1.2}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -276,6 +276,24 @@ MonoBehaviour:
   holdPoint: {fileID: 5595372691125281560}
   followSmooth: 20
   matchHoldRotation: 1
+  environmentMask:
+    serializedVersion: 2
+    m_Bits: 1536
+  wallLayers:
+    serializedVersion: 2
+    m_Bits: 512
+  groundLayers:
+    serializedVersion: 2
+    m_Bits: 1024
+  maxResolveYOffset: 4
+  maxResolveZOffset: 4
+  resolveIterations: 6
+  resolveSkin: 0.002
+  contactOffset: 0
+  debugDrawResolveBoxes: 0
+  promptRoot: {fileID: 0}
+  promptText: {fileID: 0}
+  pickUpPrompt: Press E to pick up
 --- !u!1 &6466377949908806779
 GameObject:
   m_ObjectHideFlags: 0

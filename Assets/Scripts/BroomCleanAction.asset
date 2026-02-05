@@ -35,7 +35,16 @@ MonoBehaviour:
   wiggleSideMeters: 0.05
   environmentMask:
     serializedVersion: 2
-    m_Bits: 128
-  maxResolveYOffset: 1
+    m_Bits: 1536
+  wallLayers:
+    serializedVersion: 2
+    m_Bits: 512
+  groundLayers:
+    serializedVersion: 2
+    m_Bits: 1024
+  maxResolveYOffset: 4
+  maxResolveZOffset: 4
   resolveIterations: 6
   resolveSkin: 0.002
+  debugDrawResolveBoxes: 0
+  contactOffset: 0
