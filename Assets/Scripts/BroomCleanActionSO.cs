@@ -12,7 +12,12 @@ public class BroomCleanActionSO : ItemActionSO
     public LayerMask cleanableTouchMask;
 
     [Tooltip("Clean amount applied per touch check.")]
-    public float touchCleanAmount = 0.1f;
+    public float touchCleanAmount = 0.3f;
+
+    [Header("Touch Cleaning Rate")]
+    [Tooltip("Seconds of continuous touch required before each touch-clean is applied (first clean is delayed too).")]
+    [Min(0.05f)]
+    public float touchCleanIntervalSeconds = 0.5f;
 
     [Header("Brush Sound (while touching)")]
     [Tooltip("Prefab to spawn while the broom is touching something. Typically a GameObject that has an AudioSource + PlaySoundOnce.")]
@@ -119,7 +124,8 @@ public class BroomCleanActionSO : ItemActionSO
             cooldown -= ctx.DeltaTime;
 
             // Cleaning to anything the broom is currently touching (mask-driven).
-            TryCleanTouching(ctx);
+            // Rate limiting is handled per object by Cleanable.
+            ApplyCleanToTouching(ctx);
 
             // Brush sound while pushed by collision avoidance (wall or ground).
             bool isTouchingAnything = IsPushedByEnvironment(ctx);
@@ -192,12 +198,10 @@ public class BroomCleanActionSO : ItemActionSO
             return controller.IsPushedByWall || controller.IsPushedByGround;
         }
 
-        private bool TryCleanTouching(ItemActionContext ctx)
+        private bool IsTouchingCleanable(ItemActionContext ctx)
         {
             if (ctx.Held == null) return false;
             if (so.cleanableTouchMask == 0) return false;
-
-            bool touchedAny = false;
 
             var heldColliders = ctx.Held.GetComponentsInChildren<Collider>();
             if (heldColliders == null || heldColliders.Length == 0) return false;
@@ -226,15 +230,52 @@ public class BroomCleanActionSO : ItemActionSO
                     if (hit.transform.IsChildOf(ctx.Held.transform))
                         continue;
 
-                    touchedAny = true;
-
                     var cleanable = hit.GetComponentInParent<Cleanable>();
-                    if (cleanable != null && so.touchCleanAmount > 0f)
-                        cleanable.Clean(so.touchCleanAmount);
+                    if (cleanable != null)
+                        return true;
                 }
             }
 
-            return touchedAny;
+            return false;
+        }
+
+        private void ApplyCleanToTouching(ItemActionContext ctx)
+        {
+            if (ctx.Held == null) return;
+            if (so.cleanableTouchMask == 0) return;
+            if (so.touchCleanAmount <= 0f) return;
+
+            var heldColliders = ctx.Held.GetComponentsInChildren<Collider>();
+            if (heldColliders == null || heldColliders.Length == 0) return;
+
+            Vector3 rootPos = ctx.Held.transform.position;
+            Quaternion rootRot = ctx.Held.transform.rotation;
+
+            for (int i = 0; i < heldColliders.Length; i++)
+            {
+                var c = heldColliders[i];
+                if (c == null) continue;
+                if (!c.enabled) continue;
+                if (c.isTrigger) continue;
+
+                Pose colliderPose = GetColliderWorldPoseAtTarget(c, rootPos, rootRot);
+                OrientedBox obb = GetColliderOrientedBoxAt(c, colliderPose.position, colliderPose.rotation);
+
+                var hits = Physics.OverlapBox(obb.center, obb.halfExtents, obb.rotation, so.cleanableTouchMask, QueryTriggerInteraction.Collide);
+                for (int h = 0; h < hits.Length; h++)
+                {
+                    var hit = hits[h];
+                    if (hit == null) continue;
+                    if (!hit.enabled) continue;
+
+                    if (hit.transform.IsChildOf(ctx.Held.transform))
+                        continue;
+
+                    var cleanable = hit.GetComponentInParent<Cleanable>();
+                    if (cleanable != null)
+                        cleanable.Clean(so.touchCleanAmount);
+                }
+            }
         }
 
         private void TryClean(ItemActionContext ctx)
