@@ -1,0 +1,33 @@
+# --- Unity generated folders (never version these) ---
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+
+# --- Builds (optional to ignore; usually yes) ---
+[Bb]uild/
+[Bb]uilds/
+
+# --- IDE / editor files ---
+.vs/
+.gradle/
+*.csproj
+*.sln
+*.user
+*.suo
+*.tmp
+*.pidb
+*.booproj
+*.svd
+
+# --- Unity/VS generated ---
+*.unityproj
+*.opendb
+*.VC.db
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
